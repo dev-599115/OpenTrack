@@ -1,0 +1,19 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "IBM Plex Sans", ui-sans-serif, system-ui, "Segoe UI", sans-serif;
+  --color-ink: #12303f;
+  --color-harbor: #0e6f7e;
+  --color-harbor-dark: #0a5360;
+  --color-quay: #eef2f4;
+}
+
+body {
+  background: var(--color-quay);
+  color: var(--color-ink);
+  font-variant-numeric: tabular-nums;
+}
+
+:focus-visible { outline: 2px solid var(--color-harbor); outline-offset: 2px; }
+
+.leaflet-container { font-family: inherit; }
