@@ -1,7 +1,7 @@
 import { Link, useParams } from 'react-router-dom';
 import StatusBadge from '../components/StatusBadge';
 import { useMasterBill } from '../hooks';
-import { fmtDate } from '../lib/format';
+import { fmtDate, fmtMoney } from '../lib/format';
 
 export default function MasterBillPage() {
   const { number = '' } = useParams();
@@ -29,20 +29,23 @@ export default function MasterBillPage() {
       </div>
 
       <div className="overflow-x-auto rounded-lg border border-slate-200 bg-white shadow-sm">
-        <table className="w-full min-w-[560px] text-left text-sm">
+        <table className="w-full min-w-[760px] text-left text-sm">
           <thead className="bg-slate-50 text-slate-600">
-            <tr>{['Container', 'Status', 'ETA at terminal', 'Last free day'].map((h) => <th key={h} className="px-4 py-2.5 font-medium">{h}</th>)}</tr>
+            <tr>{['Container', 'Status', 'Vessel', 'Destination', 'ETA at terminal', 'Last free day', 'Demurrage owed'].map((h) => <th key={h} className="px-4 py-2.5 font-medium">{h}</th>)}</tr>
           </thead>
           <tbody className="divide-y divide-slate-100">
             {containers.map((c) => (
               <tr key={c.containerId} className="hover:bg-slate-50">
                 <td className="px-4 py-3"><Link to={`/containers/${c.containerId}`} className="font-semibold text-harbor hover:underline">{c.containerId}</Link></td>
                 <td className="px-4 py-3"><StatusBadge status={c.status} /></td>
+                <td className="px-4 py-3">{(c.currentVessel ?? c.vessel)?.name ?? '—'}</td>
+                <td className="px-4 py-3">{c.finalDestination?.name ?? c.destinationPort?.name ?? '—'}</td>
                 <td className="px-4 py-3">{fmtDate(c.etaAtTerminal, false)}</td>
                 <td className="px-4 py-3">{fmtDate(c.lastFreeDay, false)}</td>
+                <td className={`px-4 py-3 ${c.demurrageOwedAtPort ? 'font-medium text-rose-700' : ''}`}>{fmtMoney(c.demurrageOwedAtPort)}</td>
               </tr>
             ))}
-            {!containers.length && <tr><td colSpan={4} className="px-4 py-10 text-center text-slate-500">No containers yet.</td></tr>}
+            {!containers.length && <tr><td colSpan={7} className="px-4 py-10 text-center text-slate-500">No containers yet.</td></tr>}
           </tbody>
         </table>
       </div>

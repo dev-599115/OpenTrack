@@ -1,4 +1,7 @@
-import { Link, Outlet } from 'react-router-dom';
+import { Link, NavLink, Outlet } from 'react-router-dom';
+
+const navLink = ({ isActive }: { isActive: boolean }) =>
+  `rounded-md px-3 py-1.5 text-sm font-medium ${isActive ? 'bg-white/15 text-white' : 'text-slate-300 hover:text-white'}`;
 
 export default function Layout() {
   return (
@@ -12,7 +15,10 @@ export default function Layout() {
             </svg>
             Container tracker
           </Link>
-          <span className="hidden text-sm text-slate-300 sm:block">Live data from OpenTrack</span>
+          <nav aria-label="Primary" className="flex items-center gap-1">
+            <NavLink to="/" end className={navLink}>Containers</NavLink>
+            <NavLink to="/webhooks" className={navLink}>Webhooks</NavLink>
+          </nav>
         </div>
       </header>
       <main className="mx-auto max-w-7xl px-4 py-6 sm:px-6">

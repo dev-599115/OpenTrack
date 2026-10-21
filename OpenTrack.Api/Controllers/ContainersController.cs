@@ -14,6 +14,19 @@ public sealed class ContainersController(ITrackingService tracking) : Controller
     public async Task<ActionResult<PagedResult<ContainerSummary>>> List([FromQuery] ContainerListQuery query, CancellationToken ct) =>
         Ok(await tracking.ListAsync(query, ct));
 
+    /// <summary>Status values present in the local index with counts (drives the dashboard filter).</summary>
+    [HttpGet("statuses")]
+    public async Task<ActionResult<IReadOnlyList<StatusCount>>> Statuses(CancellationToken ct) =>
+        Ok(await tracking.GetStatusCountsAsync(ct));
+
+    /// <summary>
+    /// Re-reads active containers and their master bills from OpenTrack, indexing any siblings not yet known locally.
+    /// Throttled (returns throttled=true without calling upstream if a sync ran in the last ~45s).
+    /// </summary>
+    [HttpPost("sync")]
+    public async Task<ActionResult<SyncResult>> Sync(CancellationToken ct) =>
+        Ok(await tracking.SyncAsync(ct));
+
     /// <summary>Import a container into OpenTrack tracking.</summary>
     [HttpPost]
     [ProducesResponseType(typeof(ContainerDto), StatusCodes.Status201Created)]

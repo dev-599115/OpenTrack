@@ -61,3 +61,18 @@ public sealed record ContainerSummary(
     DateTimeOffset UpdatedAt);
 
 public sealed record PagedResult<T>(IReadOnlyList<T> Items, int Total, int Page, int PageSize);
+
+public sealed record StatusCount(string Status, int Count);
+
+/// <summary>Outcome of an index sync. <see cref="Throttled"/> = another sync ran very recently (or is running); nothing was fetched.</summary>
+public sealed record SyncResult(
+    int Checked,
+    int Failed,
+    int Added,
+    int Updated,
+    bool Throttled,
+    bool RateLimited,
+    DateTimeOffset At)
+{
+    public static SyncResult Skipped() => new(0, 0, 0, 0, true, false, DateTimeOffset.UtcNow);
+}

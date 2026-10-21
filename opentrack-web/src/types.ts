@@ -126,3 +126,33 @@ export interface RouteResponse {
     route: RouteSegment[];
   };
 }
+
+export interface StatusCount { status: string; count: number }
+
+export interface SyncResult {
+  checked: number;
+  failed: number;
+  added: number;
+  updated: number;
+  /** true = the server skipped the sync because one ran in the last ~45s */
+  throttled: boolean;
+  rateLimited: boolean;
+  at: string;
+}
+
+/** OpenTrack's webhook registry is proxied as-is, so every field except the id is optional. */
+export interface Webhook {
+  id: string;
+  name?: string;
+  url?: string;
+  events?: string[];
+  createdAt?: string;
+}
+
+export interface WebhookEvent {
+  id?: string;
+  event: string;
+  containerId?: string;
+  timestamp?: string;
+  raw: unknown;
+}

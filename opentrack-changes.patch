@@ -1,0 +1,826 @@
+diff -ruN -x node_modules -x wwwroot orig/OpenTrack.Api/Controllers/ContainersController.cs opentrack/OpenTrack.Api/Controllers/ContainersController.cs
+--- a/OpenTrack.Api/Controllers/ContainersController.cs	2026-10-21 07:55:02.000000000 +0000
++++ b/OpenTrack.Api/Controllers/ContainersController.cs	2026-10-21 09:11:42.549395352 +0000
+@@ -14,6 +14,19 @@
+     public async Task<ActionResult<PagedResult<ContainerSummary>>> List([FromQuery] ContainerListQuery query, CancellationToken ct) =>
+         Ok(await tracking.ListAsync(query, ct));
+ 
++    /// <summary>Status values present in the local index with counts (drives the dashboard filter).</summary>
++    [HttpGet("statuses")]
++    public async Task<ActionResult<IReadOnlyList<StatusCount>>> Statuses(CancellationToken ct) =>
++        Ok(await tracking.GetStatusCountsAsync(ct));
++
++    /// <summary>
++    /// Re-reads active containers and their master bills from OpenTrack, indexing any siblings not yet known locally.
++    /// Throttled (returns throttled=true without calling upstream if a sync ran in the last ~45s).
++    /// </summary>
++    [HttpPost("sync")]
++    public async Task<ActionResult<SyncResult>> Sync(CancellationToken ct) =>
++        Ok(await tracking.SyncAsync(ct));
++
+     /// <summary>Import a container into OpenTrack tracking.</summary>
+     [HttpPost]
+     [ProducesResponseType(typeof(ContainerDto), StatusCodes.Status201Created)]
+diff -ruN -x node_modules -x wwwroot orig/OpenTrack.Api/Models/Requests.cs opentrack/OpenTrack.Api/Models/Requests.cs
+--- a/OpenTrack.Api/Models/Requests.cs	2026-10-21 07:54:05.000000000 +0000
++++ b/OpenTrack.Api/Models/Requests.cs	2026-10-21 09:11:06.588691965 +0000
+@@ -61,3 +61,18 @@
+     DateTimeOffset UpdatedAt);
+ 
+ public sealed record PagedResult<T>(IReadOnlyList<T> Items, int Total, int Page, int PageSize);
++
++public sealed record StatusCount(string Status, int Count);
++
++/// <summary>Outcome of an index sync. <see cref="Throttled"/> = another sync ran very recently (or is running); nothing was fetched.</summary>
++public sealed record SyncResult(
++    int Checked,
++    int Failed,
++    int Added,
++    int Updated,
++    bool Throttled,
++    bool RateLimited,
++    DateTimeOffset At)
++{
++    public static SyncResult Skipped() => new(0, 0, 0, 0, true, false, DateTimeOffset.UtcNow);
++}
+diff -ruN -x node_modules -x wwwroot orig/OpenTrack.Api/Services/TrackingService.cs opentrack/OpenTrack.Api/Services/TrackingService.cs
+--- a/OpenTrack.Api/Services/TrackingService.cs	2026-10-21 08:03:56.000000000 +0000
++++ b/OpenTrack.Api/Services/TrackingService.cs	2026-10-21 09:11:58.021080742 +0000
+@@ -18,6 +18,8 @@
+     Task<MasterBillDto> TrackMasterBillAsync(TrackMasterBillRequest request, CancellationToken ct);
+     Task<MasterBillDto> GetMasterBillAsync(string number, CancellationToken ct);
+     Task ApplyWebhookAsync(string eventName, JsonElement data, CancellationToken ct);
++    Task<IReadOnlyList<StatusCount>> GetStatusCountsAsync(CancellationToken ct);
++    Task<SyncResult> SyncAsync(CancellationToken ct);
+ }
+ 
+ public sealed class TrackingService(
+@@ -93,19 +95,115 @@
+         return removed > 0;
+     }
+ 
+-    public Task<MasterBillDto> TrackMasterBillAsync(TrackMasterBillRequest r, CancellationToken ct) =>
+-        client.TrackMasterBillAsync(Ids.MasterBill(r.Number), r.ScacCode?.Trim().ToUpperInvariant(), r.ReferenceNumbers, ct);
++    public async Task<MasterBillDto> TrackMasterBillAsync(TrackMasterBillRequest r, CancellationToken ct)
++    {
++        var mbl = Ids.MasterBill(r.Number);
++        var dto = await client.TrackMasterBillAsync(mbl, r.ScacCode?.Trim().ToUpperInvariant(), r.ReferenceNumbers, ct);
++        await IndexMasterBillAsync(dto, mbl, ct); // previously skipped: containers returned on import never reached the dashboard
++        return dto;
++    }
+ 
+     public async Task<MasterBillDto> GetMasterBillAsync(string number, CancellationToken ct)
+     {
+         var mbl = Ids.MasterBill(number);
+         var dto = await client.GetMasterBillAsync(mbl, ct);
+-        if (dto.Containers is { Count: > 0 } list)
++        await IndexMasterBillAsync(dto, mbl, ct);
++        return dto;
++    }
++
++    private async Task IndexMasterBillAsync(MasterBillDto dto, string mbl, CancellationToken ct)
++    {
++        if (dto.Containers is not { Count: > 0 } list) return;
++        foreach (var c in await UpsertAsync(list, mbl, dto.ScacCode, ct)) Cache(c);
++    }
++
++    public async Task<IReadOnlyList<StatusCount>> GetStatusCountsAsync(CancellationToken ct) =>
++        await db.TrackedContainers.AsNoTracking()
++            .GroupBy(x => x.Status)
++            .OrderByDescending(g => g.Count())
++            .Select(g => new StatusCount(g.Key, g.Count()))
++            .ToListAsync(ct);
++
++    // ---- sync: keeps the local index (what the dashboard lists) aligned with OpenTrack without needing webhooks ----------
++
++    private static readonly string[] TerminalStatuses = ["DELIVERED", "EMPTY_RETURNED", "NOT_FOUND"];
++    private static readonly TimeSpan MinSyncInterval = TimeSpan.FromSeconds(45);
++    private const int MaxUpstreamCallsPerSync = 25;
++    private const int SyncParallelism = 4;
++    private static readonly SemaphoreSlim SyncGate = new(1, 1);
++    private static long _lastSyncTicks;
++
++    /// <summary>
++    /// Refreshes every still-active container, and re-reads each distinct master bill so sibling containers that were
++    /// never opened in the UI get discovered and indexed. Throttled process-wide so many browser tabs can't hammer OpenTrack.
++    /// </summary>
++    public async Task<SyncResult> SyncAsync(CancellationToken ct)
++    {
++        if (!await SyncGate.WaitAsync(0, ct)) return SyncResult.Skipped();
++        try
+         {
+-            var applied = await UpsertAsync(list, mbl, dto.ScacCode, ct);
+-            foreach (var c in applied) Cache(c);
++            var now = DateTimeOffset.UtcNow;
++            var last = new DateTimeOffset(Interlocked.Read(ref _lastSyncTicks), TimeSpan.Zero);
++            if (now - last < MinSyncInterval) return SyncResult.Skipped();
++            Interlocked.Exchange(ref _lastSyncTicks, now.UtcTicks);
++
++            var active = await db.TrackedContainers.AsNoTracking()
++                .Where(x => x.CompletionReason == null && !TerminalStatuses.Contains(x.Status))
++                .OrderBy(x => x.UpdatedAt) // stalest first, so a capped run still rotates through everything
++                .Select(x => new { x.ContainerId, x.MasterBillNumber })
++                .ToListAsync(ct);
++
++            // One master-bill call covers all its containers, so those go first; containers without a bill are fetched individually.
++            var jobs = active.Where(x => x.MasterBillNumber != null).Select(x => (Mbl: true, Key: x.MasterBillNumber!)).Distinct()
++                .Concat(active.Where(x => x.MasterBillNumber == null).Select(x => (Mbl: false, Key: x.ContainerId)))
++                .Take(MaxUpstreamCallsPerSync)
++                .ToList();
++
++            var fetched = new System.Collections.Concurrent.ConcurrentBag<(List<ContainerDto> Items, string? Mbl, string? Scac)>();
++            var failed = 0;
++            var rateLimited = 0;
++
++            await Parallel.ForEachAsync(jobs, new ParallelOptions { MaxDegreeOfParallelism = SyncParallelism, CancellationToken = ct },
++                async (job, token) =>
++                {
++                    if (Volatile.Read(ref rateLimited) == 1) return;
++                    try
++                    {
++                        if (job.Mbl)
++                        {
++                            var mb = await client.GetMasterBillAsync(job.Key, token);
++                            if (mb.Containers is { Count: > 0 } list) fetched.Add((list, job.Key, mb.ScacCode));
++                        }
++                        else
++                        {
++                            var c = await client.GetContainerAsync(job.Key, token);
++                            if (string.IsNullOrWhiteSpace(c.ContainerId)) c.ContainerId = job.Key;
++                            fetched.Add((new List<ContainerDto> { c }, null, null));
++                        }
++                    }
++                    catch (OpenTrackApiException ex) when (ex.StatusCode == 429)
++                    {
++                        Interlocked.Exchange(ref rateLimited, 1);
++                        log.LogWarning("Sync stopped early: OpenTrack rate limit reached");
++                    }
++                    catch (Exception ex) when ((ex is OpenTrackApiException or HttpRequestException or TaskCanceledException) && !ct.IsCancellationRequested)
++                    {
++                        Interlocked.Increment(ref failed);
++                        log.LogWarning(ex, "Sync failed for {Key}", job.Key);
++                    }
++                });
++
++            // DbContext isn't thread-safe: fetch in parallel above, write sequentially here.
++            var before = await db.TrackedContainers.CountAsync(ct);
++            var applied = 0;
++            foreach (var (items, mbl, scac) in fetched)
++                foreach (var c in await UpsertAsync(items, mbl, scac, ct)) { Cache(c); applied++; }
++            var added = Math.Max(0, await db.TrackedContainers.CountAsync(ct) - before);
++
++            log.LogInformation("Sync checked {Checked} upstream resources: {Added} added, {Updated} updated, {Failed} failed", jobs.Count, added, applied - added, failed);
++            return new(jobs.Count, failed, added, Math.Max(0, applied - added), false, rateLimited == 1, DateTimeOffset.UtcNow);
+         }
+-        return dto;
++        finally { SyncGate.Release(); }
+     }
+ 
+     public async Task ApplyWebhookAsync(string eventName, JsonElement data, CancellationToken ct)
+@@ -125,29 +223,53 @@
+     private async Task<List<ContainerDto>> UpsertAsync(IReadOnlyList<ContainerDto> containers, string? fallbackMbl,
+         string? fallbackScac, CancellationToken ct)
+     {
+-        var ids = containers.Select(c => c.ContainerId.ToUpperInvariant()).ToList();
+-        var existing = await db.TrackedContainers.Where(x => ids.Contains(x.ContainerId)).ToDictionaryAsync(x => x.ContainerId, ct);
+-        var applied = new List<ContainerDto>();
++        // A blank id would collide on the unique index and, because everything is saved in ONE SaveChanges, take the
++        // whole batch down with it (silently - that is how "only some" containers of a master bill ended up indexed).
++        var batch = containers
++            .Where(c => !string.IsNullOrWhiteSpace(c.ContainerId))
++            .GroupBy(c => c.ContainerId.Trim().ToUpperInvariant())
++            .Select(g => (Id: g.Key, Dto: g.OrderByDescending(c => c.Timestamp ?? DateTimeOffset.MinValue).First()))
++            .ToList();
++
++        if (batch.Count < containers.Count)
++            log.LogWarning("Upsert dropped {Count} container snapshot(s) with a blank or duplicate containerId", containers.Count - batch.Count);
++        if (batch.Count == 0) return [];
+ 
+-        foreach (var c in containers)
++        var ids = batch.Select(b => b.Id).ToList();
++
++        for (var attempt = 1; ; attempt++)
+         {
+-            var id = c.ContainerId.ToUpperInvariant();
+-            if (!existing.TryGetValue(id, out var entity))
++            var existing = await db.TrackedContainers.Where(x => ids.Contains(x.ContainerId)).ToDictionaryAsync(x => x.ContainerId, ct);
++            var applied = new List<ContainerDto>();
++
++            foreach (var (id, c) in batch)
+             {
+-                entity = new TrackedContainer { ContainerId = id };
+-                db.TrackedContainers.Add(entity);
+-                existing[id] = entity;
++                if (!existing.TryGetValue(id, out var entity))
++                {
++                    entity = new TrackedContainer { ContainerId = id };
++                    db.TrackedContainers.Add(entity);
++                }
++                if (entity.Apply(c, fallbackMbl, fallbackScac)) applied.Add(c);
+             }
+-            if (entity.Apply(c, fallbackMbl, fallbackScac)) applied.Add(c);
+-        }
+ 
+-        try { await db.SaveChangesAsync(ct); }
+-        catch (DbUpdateException ex)
+-        {
+-            // Two concurrent requests inserted the same container (unique index). The other write wins; ours is a no-op.
+-            log.LogWarning(ex, "Concurrent upsert for {Ids}", string.Join(',', ids));
++            try
++            {
++                await db.SaveChangesAsync(ct);
++                return applied; // only what was actually persisted - callers cache this
++            }
++            catch (DbUpdateException ex)
++            {
++                // Typically a concurrent request inserted the same container (unique index). Drop our stale tracking state and
++                // retry once: the winner's row now exists, so this pass updates it instead of inserting.
++                db.ChangeTracker.Clear();
++                if (attempt >= 2)
++                {
++                    log.LogError(ex, "Upsert failed twice for {Ids}; rows were not indexed", string.Join(',', ids));
++                    return [];
++                }
++                log.LogWarning(ex, "Concurrent upsert for {Ids}; retrying", string.Join(',', ids));
++            }
+         }
+-        return applied;
+     }
+ 
+     private void Cache(ContainerDto dto)
+diff -ruN -x node_modules -x wwwroot orig/opentrack-web/src/App.tsx opentrack/opentrack-web/src/App.tsx
+--- a/opentrack-web/src/App.tsx	2026-10-21 07:56:31.000000000 +0000
++++ b/opentrack-web/src/App.tsx	2026-10-21 09:13:23.846092762 +0000
+@@ -3,6 +3,7 @@
+ import ContainerPage from './pages/ContainerPage';
+ import DashboardPage from './pages/DashboardPage';
+ import MasterBillPage from './pages/MasterBillPage';
++import WebhooksPage from './pages/WebhooksPage';
+ 
+ export default function App() {
+   return (
+@@ -11,6 +12,7 @@
+         <Route index element={<DashboardPage />} />
+         <Route path="containers/:id" element={<ContainerPage />} />
+         <Route path="master-bills/:number" element={<MasterBillPage />} />
++        <Route path="webhooks" element={<WebhooksPage />} />
+         <Route path="*" element={<p>That page doesn’t exist. <Link className="text-harbor underline" to="/">Go to containers</Link></p>} />
+       </Route>
+     </Routes>
+diff -ruN -x node_modules -x wwwroot orig/opentrack-web/src/components/Layout.tsx opentrack/opentrack-web/src/components/Layout.tsx
+--- a/opentrack-web/src/components/Layout.tsx	2026-10-21 07:56:31.000000000 +0000
++++ b/opentrack-web/src/components/Layout.tsx	2026-10-21 09:13:23.846518243 +0000
+@@ -1,4 +1,7 @@
+-import { Link, Outlet } from 'react-router-dom';
++import { Link, NavLink, Outlet } from 'react-router-dom';
++
++const navLink = ({ isActive }: { isActive: boolean }) =>
++  `rounded-md px-3 py-1.5 text-sm font-medium ${isActive ? 'bg-white/15 text-white' : 'text-slate-300 hover:text-white'}`;
+ 
+ export default function Layout() {
+   return (
+@@ -12,7 +15,10 @@
+             </svg>
+             Container tracker
+           </Link>
+-          <span className="hidden text-sm text-slate-300 sm:block">Live data from OpenTrack</span>
++          <nav aria-label="Primary" className="flex items-center gap-1">
++            <NavLink to="/" end className={navLink}>Containers</NavLink>
++            <NavLink to="/webhooks" className={navLink}>Webhooks</NavLink>
++          </nav>
+         </div>
+       </header>
+       <main className="mx-auto max-w-7xl px-4 py-6 sm:px-6">
+diff -ruN -x node_modules -x wwwroot orig/opentrack-web/src/hooks.ts opentrack/opentrack-web/src/hooks.ts
+--- a/opentrack-web/src/hooks.ts	2026-10-21 07:55:34.000000000 +0000
++++ b/opentrack-web/src/hooks.ts	2026-10-21 09:12:31.182069566 +0000
+@@ -1,6 +1,8 @@
+ import { keepPreviousData, useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+ import { useEffect, useState } from 'react';
+ import { api } from './lib/api';
++import { pickList, toEvent, toWebhook } from './lib/normalize';
++import type { Webhook } from './types';
+ 
+ export function useDebounced<T>(value: T, ms = 300): T {
+   const [v, setV] = useState(value);
+@@ -11,8 +13,30 @@
+   return v;
+ }
+ 
+-export const useContainerList = (p: { search?: string; page: number; pageSize: number }) =>
+-  useQuery({ queryKey: ['containers', p], queryFn: () => api.listContainers(p), placeholderData: keepPreviousData });
++/**
++ * The list is served from the API's local index, which webhooks and /sync keep current. The app-wide default turns off
++ * refetch-on-focus, which is why the dashboard looked frozen; here we poll (paused automatically while the tab is hidden)
++ * and refetch on focus so server-side changes show up without a manual reload.
++ */
++const LIVE = { refetchInterval: 30_000, refetchOnWindowFocus: true } as const;
++
++export const useContainerList = (p: { search?: string; status?: string; page: number; pageSize: number }) =>
++  useQuery({ queryKey: ['containers', p], queryFn: () => api.listContainers(p), placeholderData: keepPreviousData, ...LIVE });
++
++export const useStatusCounts = () =>
++  useQuery({ queryKey: ['containers', 'statuses'], queryFn: api.containerStatuses, ...LIVE });
++
++export function useSyncContainers() {
++  const qc = useQueryClient();
++  return useMutation({
++    mutationFn: api.syncContainers,
++    // Sync rewrites rows the list, facets and open detail pages are built from.
++    onSuccess: () => Promise.all([
++      qc.invalidateQueries({ queryKey: ['containers'] }),
++      qc.invalidateQueries({ queryKey: ['container'] }),
++    ]),
++  });
++}
+ 
+ export const useContainer = (id: string) =>
+   useQuery({ queryKey: ['container', id], queryFn: () => api.getContainer(id), refetchInterval: 60_000 });
+@@ -33,10 +57,37 @@
+ }
+ 
+ export function useTrackMasterBill() {
+-  return useMutation({ mutationFn: api.trackMasterBill });
++  const qc = useQueryClient();
++  // The API now indexes the containers it gets back on import; make the dashboard pick them up.
++  return useMutation({ mutationFn: api.trackMasterBill, onSuccess: () => qc.invalidateQueries({ queryKey: ['containers'] }) });
+ }
+ 
+ export function useRemoveContainer() {
+   const qc = useQueryClient();
+   return useMutation({ mutationFn: api.removeContainer, onSuccess: () => qc.invalidateQueries({ queryKey: ['containers'] }) });
+ }
++
++// ---- Webhook admin + event replay ---------------------------------------------------------------------------------
++
++export const useWebhooks = () =>
++  useQuery({
++    queryKey: ['webhooks'],
++    queryFn: api.listWebhooks,
++    select: (raw): Webhook[] => pickList(raw).map(toWebhook).filter((w): w is Webhook => !!w),
++    retry: false, // 401/403 (not an admin) should surface immediately
++  });
++
++export function useRegisterWebhook() {
++  const qc = useQueryClient();
++  return useMutation({ mutationFn: api.registerWebhook, onSuccess: () => qc.invalidateQueries({ queryKey: ['webhooks'] }) });
++}
++
++export function useDeleteWebhook() {
++  const qc = useQueryClient();
++  return useMutation({ mutationFn: api.deleteWebhook, onSuccess: () => qc.invalidateQueries({ queryKey: ['webhooks'] }) });
++}
++
++/** On demand (not a query): replaying hits OpenTrack once per click. */
++export const useReplayEvents = () => useMutation({ mutationFn: api.replayEvents });
++
++export const parseEvents = (raw: unknown) => pickList(raw).map(toEvent);
+diff -ruN -x node_modules -x wwwroot orig/opentrack-web/src/lib/api.ts opentrack/opentrack-web/src/lib/api.ts
+--- a/opentrack-web/src/lib/api.ts	2026-10-21 07:55:34.000000000 +0000
++++ b/opentrack-web/src/lib/api.ts	2026-10-21 09:12:07.886112041 +0000
+@@ -1,4 +1,4 @@
+-import type { Container, ContainerSummary, MasterBill, Paged, RouteResponse } from '../types';
++import type { Container, ContainerSummary, MasterBill, Paged, RouteResponse, StatusCount, SyncResult } from '../types';
+ 
+ const BASE = import.meta.env.VITE_API_BASE ?? '';
+ 
+@@ -32,13 +32,20 @@
+ 
+ export interface TrackContainerBody { containerId: string; scacCode: string; masterBillNumber: string }
+ export interface TrackMasterBillBody { number: string; scacCode?: string }
++export interface RegisterWebhookBody { url: string; name?: string; events?: string[] }
++export interface ReplayEventsParams { timestamp: number; containerId?: string; page?: number; perPage?: number }
++
++const toQuery = (p: object) => {
++  const qs = new URLSearchParams();
++  Object.entries(p).forEach(([k, v]) => v !== undefined && v !== '' && qs.set(k, String(v)));
++  return qs.toString();
++};
+ 
+ export const api = {
+-  listContainers: (p: { search?: string; status?: string; page?: number; pageSize?: number }) => {
+-    const qs = new URLSearchParams();
+-    Object.entries(p).forEach(([k, v]) => v !== undefined && v !== '' && qs.set(k, String(v)));
+-    return request<Paged<ContainerSummary>>(`/api/containers?${qs}`);
+-  },
++  listContainers: (p: { search?: string; status?: string; page?: number; pageSize?: number }) =>
++    request<Paged<ContainerSummary>>(`/api/containers?${toQuery(p)}`),
++  containerStatuses: () => request<StatusCount[]>('/api/containers/statuses'),
++  syncContainers: () => request<SyncResult>('/api/containers/sync', { method: 'POST' }),
+   trackContainer: (body: TrackContainerBody) =>
+     request<Container>('/api/containers', { method: 'POST', body: JSON.stringify(body) }),
+   getContainer: (id: string, refresh = false) =>
+@@ -49,4 +56,12 @@
+   trackMasterBill: (body: TrackMasterBillBody) =>
+     request<MasterBill>('/api/master-bills', { method: 'POST', body: JSON.stringify(body) }),
+   getMasterBill: (number: string) => request<MasterBill>(`/api/master-bills/${encodeURIComponent(number)}`),
++
++  // Webhook management + event replay (Admin role when Auth:Enabled=true). Payload shapes are OpenTrack's, so they stay `unknown`
++  // here and are normalised in lib/normalize.ts.
++  listWebhooks: () => request<unknown>('/api/webhooks'),
++  registerWebhook: (body: RegisterWebhookBody) =>
++    request<unknown>('/api/webhooks', { method: 'POST', body: JSON.stringify(body) }),
++  deleteWebhook: (id: string) => request<void>(`/api/webhooks/${encodeURIComponent(id)}`, { method: 'DELETE' }),
++  replayEvents: (p: ReplayEventsParams) => request<unknown>(`/api/webhooks/events?${toQuery(p)}`),
+ };
+diff -ruN -x node_modules -x wwwroot orig/opentrack-web/src/lib/normalize.ts opentrack/opentrack-web/src/lib/normalize.ts
+--- a/opentrack-web/src/lib/normalize.ts	1970-01-01 00:00:00.000000000 +0000
++++ b/opentrack-web/src/lib/normalize.ts	2026-10-21 09:12:18.529724264 +0000
+@@ -0,0 +1,56 @@
++import type { Webhook, WebhookEvent } from '../types';
++
++type Obj = Record<string, unknown>;
++const isObj = (v: unknown): v is Obj => typeof v === 'object' && v !== null && !Array.isArray(v);
++
++const str = (v: unknown): string | undefined =>
++  typeof v === 'string' && v ? v : typeof v === 'number' ? String(v) : undefined;
++
++const first = (o: Obj, ...keys: string[]) => {
++  for (const k of keys) {
++    const s = str(o[k]);
++    if (s) return s;
++  }
++  return undefined;
++};
++
++/**
++ * The webhook/event endpoints are proxied untouched, so the list may arrive as a bare array or wrapped
++ * (`{ data: [...] }`, `{ data: { events: [...] } }`, ...). Returns the first array found.
++ */
++export function pickList(v: unknown, depth = 0): unknown[] {
++  if (Array.isArray(v)) return v;
++  if (!isObj(v) || depth > 2) return [];
++  for (const k of ['data', 'webhooks', 'events', 'items', 'results']) {
++    const found = pickList(v[k], depth + 1);
++    if (found.length) return found;
++  }
++  return [];
++}
++
++export function toWebhook(r: unknown): Webhook | undefined {
++  if (!isObj(r)) return undefined;
++  const id = first(r, 'id', 'webhookId', '_id');
++  if (!id) return undefined;
++  const events = Array.isArray(r.events) ? r.events.filter((e): e is string => typeof e === 'string') : undefined;
++  return { id, name: first(r, 'name'), url: first(r, 'url'), events, createdAt: first(r, 'createdAt', 'created_at') };
++}
++
++/** Accepts ISO strings or Unix epochs (seconds or milliseconds) and returns something `new Date()` can parse. */
++function toIso(v?: string): string | undefined {
++  if (!v || !/^\d{9,13}$/.test(v)) return v;
++  const n = Number(v);
++  return new Date(n < 1e11 ? n * 1000 : n).toISOString();
++}
++
++export function toEvent(r: unknown): WebhookEvent {
++  if (!isObj(r)) return { event: 'unknown', raw: r };
++  const data = isObj(r.data) ? r.data : undefined;
++  return {
++    id: first(r, 'id', 'eventId'),
++    event: first(r, 'event', 'type', 'eventType') ?? 'unknown',
++    containerId: first(r, 'containerId') ?? (data && first(data, 'containerId')),
++    timestamp: toIso(first(r, 'timestamp', 'createdAt', 'occurredAt') ?? (data && first(data, 'timestamp'))),
++    raw: r,
++  };
++}
+diff -ruN -x node_modules -x wwwroot orig/opentrack-web/src/pages/DashboardPage.tsx opentrack/opentrack-web/src/pages/DashboardPage.tsx
+--- a/opentrack-web/src/pages/DashboardPage.tsx	2026-10-21 07:56:31.000000000 +0000
++++ b/opentrack-web/src/pages/DashboardPage.tsx	2026-10-21 09:12:55.956262270 +0000
+@@ -1,17 +1,31 @@
+-import { useState } from 'react';
++import { useEffect, useState } from 'react';
+ import { Link } from 'react-router-dom';
+ import StatusBadge from '../components/StatusBadge';
+ import TrackForm from '../components/TrackForm';
+-import { useContainerList, useDebounced } from '../hooks';
+-import { daysUntil, fmtDate, fmtMoney } from '../lib/format';
++import { useContainerList, useDebounced, useStatusCounts, useSyncContainers } from '../hooks';
++import { daysUntil, fmtDate, fmtMoney, humanize } from '../lib/format';
++
++const AUTO_SYNC_MS = 5 * 60_000;
+ 
+ export default function DashboardPage() {
+   const [search, setSearch] = useState('');
++  const [status, setStatus] = useState('');
+   const [page, setPage] = useState(1);
+   const debounced = useDebounced(search);
+-  const { data, isLoading, isFetching, error } = useContainerList({ search: debounced, page, pageSize: 20 });
++  const { data, isLoading, isFetching, error } = useContainerList({ search: debounced, status, page, pageSize: 20 });
++  const statuses = useStatusCounts();
++  const { mutate: runSync, isPending: syncing, data: syncResult, error: syncError } = useSyncContainers();
+   const pages = data ? Math.max(1, Math.ceil(data.total / data.pageSize)) : 1;
+ 
++  // Pull fresh data from OpenTrack on load and every few minutes while the tab is visible. The server throttles this
++  // process-wide, so extra tabs (or StrictMode's double effect in dev) don't cause extra upstream calls.
++  useEffect(() => {
++    const run = () => { if (document.visibilityState === 'visible') runSync(); };
++    run();
++    const t = setInterval(run, AUTO_SYNC_MS);
++    return () => clearInterval(t);
++  }, [runSync]);
++
+   return (
+     <div className="space-y-6">
+       <TrackForm />
+@@ -21,11 +35,31 @@
+           <h2 className="text-base font-semibold">
+             Tracked containers {data && <span className="font-normal text-slate-500">({data.total})</span>}
+           </h2>
+-          <input type="search" value={search} onChange={(e) => { setSearch(e.target.value); setPage(1); }}
+-            placeholder="Search container or master bill" aria-label="Search containers"
+-            className="w-full rounded-md border border-slate-300 px-3 py-2 text-sm sm:w-72" />
++          <div className="flex w-full flex-wrap items-center gap-2 sm:w-auto">
++            <select value={status} onChange={(e) => { setStatus(e.target.value); setPage(1); }} aria-label="Filter by status"
++              className="rounded-md border border-slate-300 bg-white px-3 py-2 text-sm">
++              <option value="">All statuses</option>
++              {statuses.data?.map((s) => <option key={s.status} value={s.status}>{humanize(s.status)} ({s.count})</option>)}
++            </select>
++            <input type="search" value={search} onChange={(e) => { setSearch(e.target.value); setPage(1); }}
++              placeholder="Search container or master bill" aria-label="Search containers"
++              className="w-full rounded-md border border-slate-300 px-3 py-2 text-sm sm:w-64" />
++            <button type="button" onClick={() => runSync()} disabled={syncing}
++              className="rounded-md border border-slate-300 bg-white px-3 py-2 text-sm font-medium hover:bg-slate-50 disabled:opacity-50">
++              {syncing ? 'Syncing…' : 'Sync now'}
++            </button>
++          </div>
+         </div>
+ 
++        {(syncError || (syncResult && !syncResult.throttled)) && (
++          <p role="status" className={`border-b border-slate-100 px-4 py-2 text-xs ${syncError || syncResult?.rateLimited || syncResult?.failed ? 'text-amber-800' : 'text-slate-500'}`}>
++            {syncError ? `Sync failed: ${syncError.message}`
++              : syncResult && `Synced ${fmtDate(syncResult.at)}: ${syncResult.added} new, ${syncResult.updated} updated`
++                + (syncResult.failed ? `, ${syncResult.failed} failed` : '')
++                + (syncResult.rateLimited ? '. OpenTrack rate limit reached, the rest will sync next time.' : '')}
++          </p>
++        )}
++
+         {error && <p role="alert" className="p-4 text-sm text-rose-700">Couldn’t load containers: {error.message}</p>}
+ 
+         <div className="overflow-x-auto">
+@@ -67,7 +101,7 @@
+               })}
+               {data && !data.items.length && (
+                 <tr><td colSpan={7} className="px-4 py-10 text-center text-slate-500">
+-                  {debounced ? 'No containers match that search.' : 'Nothing tracked yet. Add a container or master bill above.'}
++                  {debounced || status ? 'No containers match those filters.' : 'Nothing tracked yet. Add a container or master bill above.'}
+                 </td></tr>
+               )}
+             </tbody>
+diff -ruN -x node_modules -x wwwroot orig/opentrack-web/src/pages/MasterBillPage.tsx opentrack/opentrack-web/src/pages/MasterBillPage.tsx
+--- a/opentrack-web/src/pages/MasterBillPage.tsx	2026-10-21 07:56:31.000000000 +0000
++++ b/opentrack-web/src/pages/MasterBillPage.tsx	2026-10-21 09:12:55.956790240 +0000
+@@ -1,7 +1,7 @@
+ import { Link, useParams } from 'react-router-dom';
+ import StatusBadge from '../components/StatusBadge';
+ import { useMasterBill } from '../hooks';
+-import { fmtDate } from '../lib/format';
++import { fmtDate, fmtMoney } from '../lib/format';
+ 
+ export default function MasterBillPage() {
+   const { number = '' } = useParams();
+@@ -29,20 +29,23 @@
+       </div>
+ 
+       <div className="overflow-x-auto rounded-lg border border-slate-200 bg-white shadow-sm">
+-        <table className="w-full min-w-[560px] text-left text-sm">
++        <table className="w-full min-w-[760px] text-left text-sm">
+           <thead className="bg-slate-50 text-slate-600">
+-            <tr>{['Container', 'Status', 'ETA at terminal', 'Last free day'].map((h) => <th key={h} className="px-4 py-2.5 font-medium">{h}</th>)}</tr>
++            <tr>{['Container', 'Status', 'Vessel', 'Destination', 'ETA at terminal', 'Last free day', 'Demurrage owed'].map((h) => <th key={h} className="px-4 py-2.5 font-medium">{h}</th>)}</tr>
+           </thead>
+           <tbody className="divide-y divide-slate-100">
+             {containers.map((c) => (
+               <tr key={c.containerId} className="hover:bg-slate-50">
+                 <td className="px-4 py-3"><Link to={`/containers/${c.containerId}`} className="font-semibold text-harbor hover:underline">{c.containerId}</Link></td>
+                 <td className="px-4 py-3"><StatusBadge status={c.status} /></td>
++                <td className="px-4 py-3">{(c.currentVessel ?? c.vessel)?.name ?? '—'}</td>
++                <td className="px-4 py-3">{c.finalDestination?.name ?? c.destinationPort?.name ?? '—'}</td>
+                 <td className="px-4 py-3">{fmtDate(c.etaAtTerminal, false)}</td>
+                 <td className="px-4 py-3">{fmtDate(c.lastFreeDay, false)}</td>
++                <td className={`px-4 py-3 ${c.demurrageOwedAtPort ? 'font-medium text-rose-700' : ''}`}>{fmtMoney(c.demurrageOwedAtPort)}</td>
+               </tr>
+             ))}
+-            {!containers.length && <tr><td colSpan={4} className="px-4 py-10 text-center text-slate-500">No containers yet.</td></tr>}
++            {!containers.length && <tr><td colSpan={7} className="px-4 py-10 text-center text-slate-500">No containers yet.</td></tr>}
+           </tbody>
+         </table>
+       </div>
+diff -ruN -x node_modules -x wwwroot orig/opentrack-web/src/pages/WebhooksPage.tsx opentrack/opentrack-web/src/pages/WebhooksPage.tsx
+--- a/opentrack-web/src/pages/WebhooksPage.tsx	1970-01-01 00:00:00.000000000 +0000
++++ b/opentrack-web/src/pages/WebhooksPage.tsx	2026-10-21 09:13:19.240691747 +0000
+@@ -0,0 +1,175 @@
++import { FormEvent, useMemo, useState } from 'react';
++import { Link } from 'react-router-dom';
++import { parseEvents, useDeleteWebhook, useRegisterWebhook, useReplayEvents, useWebhooks } from '../hooks';
++import { ApiError } from '../lib/api';
++import { fmtDate } from '../lib/format';
++
++const KNOWN_EVENTS = ['container.status.updated', 'container.location.updated'];
++const field = 'mt-1 block w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm shadow-sm';
++
++const isForbidden = (e: unknown) => e instanceof ApiError && (e.status === 401 || e.status === 403);
++
++/** `datetime-local` value (local time, no zone) for "n hours ago". */
++const localInput = (hoursAgo: number) => {
++  const d = new Date(Date.now() - hoursAgo * 3_600_000);
++  d.setMinutes(d.getMinutes() - d.getTimezoneOffset());
++  return d.toISOString().slice(0, 16);
++};
++
++export default function WebhooksPage() {
++  const hooks = useWebhooks();
++  const register = useRegisterWebhook();
++  const remove = useDeleteWebhook();
++  const replay = useReplayEvents();
++
++  const [url, setUrl] = useState('');
++  const [name, setName] = useState('tracker');
++  const [events, setEvents] = useState<string[]>([]);
++
++  const [since, setSince] = useState(() => localInput(24));
++  const [replayContainer, setReplayContainer] = useState('');
++
++  const replayed = useMemo(() => (replay.data ? parseEvents(replay.data) : []), [replay.data]);
++
++  function submitRegister(e: FormEvent) {
++    e.preventDefault();
++    register.mutate(
++      { url: url.trim(), name: name.trim() || undefined, events: events.length ? events : undefined },
++      { onSuccess: () => { setUrl(''); setEvents([]); } },
++    );
++  }
++
++  function submitReplay(e: FormEvent) {
++    e.preventDefault();
++    const ts = Math.floor(new Date(since).getTime() / 1000);
++    if (!Number.isFinite(ts)) return;
++    replay.mutate({ timestamp: ts, containerId: replayContainer.trim().toUpperCase() || undefined, perPage: 25 });
++  }
++
++  if (isForbidden(hooks.error)) {
++    return (
++      <div role="alert" className="rounded-lg bg-amber-50 p-4 text-amber-900">
++        <p className="font-semibold">Admin access required</p>
++        <p className="text-sm">Webhook management is limited to the Admin role. Sign in with an admin account and try again.</p>
++        <Link to="/" className="mt-2 inline-block text-sm underline">Back to containers</Link>
++      </div>
++    );
++  }
++
++  return (
++    <div className="space-y-6">
++      <div>
++        <h1 className="text-2xl font-semibold tracking-tight">Webhooks</h1>
++        <p className="mt-1 text-sm text-slate-600">
++          OpenTrack pushes status and location changes to your API so the dashboard stays current between syncs.
++          The signing secret is read from the server’s <code>OpenTrack:WebhookSecret</code> and never shown here.
++        </p>
++      </div>
++
++      <section className="rounded-lg border border-slate-200 bg-white shadow-sm">
++        <h2 className="border-b border-slate-200 p-4 text-base font-semibold">Registered webhooks</h2>
++        {hooks.isLoading && <p className="p-4 text-sm text-slate-500">Loading…</p>}
++        {hooks.error && <p role="alert" className="p-4 text-sm text-rose-700">Couldn’t load webhooks: {hooks.error.message}</p>}
++        {hooks.data && (
++          <ul className="divide-y divide-slate-100">
++            {hooks.data.map((w) => (
++              <li key={w.id} className="flex flex-wrap items-center justify-between gap-3 px-4 py-3 text-sm">
++                <div className="min-w-0">
++                  <p className="font-medium">{w.name ?? w.id}</p>
++                  <p className="truncate text-slate-600">{w.url ?? '—'}</p>
++                  <p className="text-xs text-slate-500">
++                    {w.events?.length ? w.events.join(', ') : 'All events'}{w.createdAt ? ` · created ${fmtDate(w.createdAt)}` : ''}
++                  </p>
++                </div>
++                <button
++                  disabled={remove.isPending}
++                  onClick={() => confirm(`Delete webhook “${w.name ?? w.id}”? OpenTrack will stop sending events to it.`) && remove.mutate(w.id)}
++                  className="rounded-md border border-rose-300 bg-white px-3 py-1.5 font-medium text-rose-700 hover:bg-rose-50 disabled:opacity-50">
++                  Delete
++                </button>
++              </li>
++            ))}
++            {!hooks.data.length && <li className="px-4 py-8 text-center text-sm text-slate-500">No webhooks registered yet.</li>}
++          </ul>
++        )}
++        {remove.error && <p role="alert" className="border-t border-slate-100 p-4 text-sm text-rose-700">{remove.error.message}</p>}
++      </section>
++
++      <form onSubmit={submitRegister} className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm">
++        <h2 className="mb-3 text-base font-semibold">Register a webhook</h2>
++        <div className="grid gap-3 md:grid-cols-3">
++          <label className="text-sm font-medium md:col-span-2">Public HTTPS URL
++            <input className={field} type="url" required pattern="https://.+" placeholder="https://your-host/api/webhooks/opentrack"
++              value={url} onChange={(e) => setUrl(e.target.value)} />
++          </label>
++          <label className="text-sm font-medium">Name
++            <input className={field} maxLength={100} value={name} onChange={(e) => setName(e.target.value)} />
++          </label>
++        </div>
++        <fieldset className="mt-3">
++          <legend className="text-sm font-medium">Events <span className="font-normal text-slate-500">(none selected = all events)</span></legend>
++          <div className="mt-1 flex flex-wrap gap-4">
++            {KNOWN_EVENTS.map((ev) => (
++              <label key={ev} className="flex items-center gap-2 text-sm">
++                <input type="checkbox" checked={events.includes(ev)}
++                  onChange={(e) => setEvents((cur) => (e.target.checked ? [...cur, ev] : cur.filter((x) => x !== ev)))} />
++                {ev}
++              </label>
++            ))}
++          </div>
++        </fieldset>
++        <button type="submit" disabled={register.isPending}
++          className="mt-4 rounded-md bg-harbor px-4 py-2 text-sm font-semibold text-white hover:bg-harbor-dark disabled:opacity-60">
++          {register.isPending ? 'Registering…' : 'Register webhook'}
++        </button>
++        {register.error && <p role="alert" className="mt-3 rounded-md bg-rose-50 px-3 py-2 text-sm text-rose-800">{register.error.message}</p>}
++        {register.isSuccess && <p role="status" className="mt-3 text-sm text-emerald-700">Webhook registered.</p>}
++      </form>
++
++      <form onSubmit={submitReplay} className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm">
++        <h2 className="text-base font-semibold">Replay missed events</h2>
++        <p className="mb-3 mt-1 text-sm text-slate-600">After downtime, fetch what OpenTrack sent since a point in time (up to 25 per request).</p>
++        <div className="grid gap-3 md:grid-cols-4">
++          <label className="text-sm font-medium md:col-span-2">Since
++            <input className={field} type="datetime-local" required value={since} onChange={(e) => setSince(e.target.value)} />
++          </label>
++          <label className="text-sm font-medium">Container (optional)
++            <input className={`${field} uppercase`} maxLength={11} placeholder="MRKU2642087" value={replayContainer}
++              onChange={(e) => setReplayContainer(e.target.value)} />
++          </label>
++          <div className="flex items-end">
++            <button type="submit" disabled={replay.isPending}
++              className="w-full rounded-md border border-slate-300 bg-white px-4 py-2 text-sm font-semibold hover:bg-slate-50 disabled:opacity-60">
++              {replay.isPending ? 'Fetching…' : 'Fetch events'}
++            </button>
++          </div>
++        </div>
++        {replay.error && (
++          <p role="alert" className="mt-3 rounded-md bg-rose-50 px-3 py-2 text-sm text-rose-800">
++            {isForbidden(replay.error) ? 'Admin access required.' : replay.error.message}
++          </p>
++        )}
++        {replay.isSuccess && (
++          <ul className="mt-4 divide-y divide-slate-100 rounded-md border border-slate-200 text-sm">
++            {replayed.map((ev, i) => (
++              <li key={ev.id ?? i} className="px-3 py-2">
++                <div className="flex flex-wrap items-center justify-between gap-2">
++                  <span className="font-medium">{ev.event}</span>
++                  <span className="text-slate-600">
++                    {ev.containerId ? <Link className="text-harbor hover:underline" to={`/containers/${ev.containerId}`}>{ev.containerId}</Link> : '—'}
++                    {' · '}{fmtDate(ev.timestamp)}
++                  </span>
++                </div>
++                <details className="mt-1">
++                  <summary className="cursor-pointer text-xs text-slate-500">Raw payload</summary>
++                  <pre className="mt-1 max-h-60 overflow-auto rounded bg-slate-50 p-2 text-xs">{JSON.stringify(ev.raw, null, 2)}</pre>
++                </details>
++              </li>
++            ))}
++            {!replayed.length && <li className="px-3 py-6 text-center text-slate-500">No events in that window.</li>}
++          </ul>
++        )}
++      </form>
++    </div>
++  );
++}
+diff -ruN -x node_modules -x wwwroot orig/opentrack-web/src/types.ts opentrack/opentrack-web/src/types.ts
+--- a/opentrack-web/src/types.ts	2026-10-21 08:35:55.000000000 +0000
++++ b/opentrack-web/src/types.ts	2026-10-21 09:12:07.868691864 +0000
+@@ -125,4 +125,34 @@
+     status: string;
+     route: RouteSegment[];
+   };
+-}
+\ No newline at end of file
++}
++
++export interface StatusCount { status: string; count: number }
++
++export interface SyncResult {
++  checked: number;
++  failed: number;
++  added: number;
++  updated: number;
++  /** true = the server skipped the sync because one ran in the last ~45s */
++  throttled: boolean;
++  rateLimited: boolean;
++  at: string;
++}
++
++/** OpenTrack's webhook registry is proxied as-is, so every field except the id is optional. */
++export interface Webhook {
++  id: string;
++  name?: string;
++  url?: string;
++  events?: string[];
++  createdAt?: string;
++}
++
++export interface WebhookEvent {
++  id?: string;
++  event: string;
++  containerId?: string;
++  timestamp?: string;
++  raw: unknown;
++}

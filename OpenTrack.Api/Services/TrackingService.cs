@@ -18,6 +18,8 @@ public interface ITrackingService
     Task<MasterBillDto> TrackMasterBillAsync(TrackMasterBillRequest request, CancellationToken ct);
     Task<MasterBillDto> GetMasterBillAsync(string number, CancellationToken ct);
     Task ApplyWebhookAsync(string eventName, JsonElement data, CancellationToken ct);
+    Task<IReadOnlyList<StatusCount>> GetStatusCountsAsync(CancellationToken ct);
+    Task<SyncResult> SyncAsync(CancellationToken ct);
 }
 
 public sealed class TrackingService(
@@ -93,19 +95,115 @@ public sealed class TrackingService(
         return removed > 0;
     }
 
-    public Task<MasterBillDto> TrackMasterBillAsync(TrackMasterBillRequest r, CancellationToken ct) =>
-        client.TrackMasterBillAsync(Ids.MasterBill(r.Number), r.ScacCode?.Trim().ToUpperInvariant(), r.ReferenceNumbers, ct);
+    public async Task<MasterBillDto> TrackMasterBillAsync(TrackMasterBillRequest r, CancellationToken ct)
+    {
+        var mbl = Ids.MasterBill(r.Number);
+        var dto = await client.TrackMasterBillAsync(mbl, r.ScacCode?.Trim().ToUpperInvariant(), r.ReferenceNumbers, ct);
+        await IndexMasterBillAsync(dto, mbl, ct); // previously skipped: containers returned on import never reached the dashboard
+        return dto;
+    }
 
     public async Task<MasterBillDto> GetMasterBillAsync(string number, CancellationToken ct)
     {
         var mbl = Ids.MasterBill(number);
         var dto = await client.GetMasterBillAsync(mbl, ct);
-        if (dto.Containers is { Count: > 0 } list)
-        {
-            var applied = await UpsertAsync(list, mbl, dto.ScacCode, ct);
-            foreach (var c in applied) Cache(c);
-        }
+        await IndexMasterBillAsync(dto, mbl, ct);
         return dto;
+    }
+
+    private async Task IndexMasterBillAsync(MasterBillDto dto, string mbl, CancellationToken ct)
+    {
+        if (dto.Containers is not { Count: > 0 } list) return;
+        foreach (var c in await UpsertAsync(list, mbl, dto.ScacCode, ct)) Cache(c);
+    }
+
+    public async Task<IReadOnlyList<StatusCount>> GetStatusCountsAsync(CancellationToken ct) =>
+        await db.TrackedContainers.AsNoTracking()
+            .GroupBy(x => x.Status)
+            .OrderByDescending(g => g.Count())
+            .Select(g => new StatusCount(g.Key, g.Count()))
+            .ToListAsync(ct);
+
+    // ---- sync: keeps the local index (what the dashboard lists) aligned with OpenTrack without needing webhooks ----------
+
+    private static readonly string[] TerminalStatuses = ["DELIVERED", "EMPTY_RETURNED", "NOT_FOUND"];
+    private static readonly TimeSpan MinSyncInterval = TimeSpan.FromSeconds(45);
+    private const int MaxUpstreamCallsPerSync = 25;
+    private const int SyncParallelism = 4;
+    private static readonly SemaphoreSlim SyncGate = new(1, 1);
+    private static long _lastSyncTicks;
+
+    /// <summary>
+    /// Refreshes every still-active container, and re-reads each distinct master bill so sibling containers that were
+    /// never opened in the UI get discovered and indexed. Throttled process-wide so many browser tabs can't hammer OpenTrack.
+    /// </summary>
+    public async Task<SyncResult> SyncAsync(CancellationToken ct)
+    {
+        if (!await SyncGate.WaitAsync(0, ct)) return SyncResult.Skipped();
+        try
+        {
+            var now = DateTimeOffset.UtcNow;
+            var last = new DateTimeOffset(Interlocked.Read(ref _lastSyncTicks), TimeSpan.Zero);
+            if (now - last < MinSyncInterval) return SyncResult.Skipped();
+            Interlocked.Exchange(ref _lastSyncTicks, now.UtcTicks);
+
+            var active = await db.TrackedContainers.AsNoTracking()
+                .Where(x => x.CompletionReason == null && !TerminalStatuses.Contains(x.Status))
+                .OrderBy(x => x.UpdatedAt) // stalest first, so a capped run still rotates through everything
+                .Select(x => new { x.ContainerId, x.MasterBillNumber })
+                .ToListAsync(ct);
+
+            // One master-bill call covers all its containers, so those go first; containers without a bill are fetched individually.
+            var jobs = active.Where(x => x.MasterBillNumber != null).Select(x => (Mbl: true, Key: x.MasterBillNumber!)).Distinct()
+                .Concat(active.Where(x => x.MasterBillNumber == null).Select(x => (Mbl: false, Key: x.ContainerId)))
+                .Take(MaxUpstreamCallsPerSync)
+                .ToList();
+
+            var fetched = new System.Collections.Concurrent.ConcurrentBag<(List<ContainerDto> Items, string? Mbl, string? Scac)>();
+            var failed = 0;
+            var rateLimited = 0;
+
+            await Parallel.ForEachAsync(jobs, new ParallelOptions { MaxDegreeOfParallelism = SyncParallelism, CancellationToken = ct },
+                async (job, token) =>
+                {
+                    if (Volatile.Read(ref rateLimited) == 1) return;
+                    try
+                    {
+                        if (job.Mbl)
+                        {
+                            var mb = await client.GetMasterBillAsync(job.Key, token);
+                            if (mb.Containers is { Count: > 0 } list) fetched.Add((list, job.Key, mb.ScacCode));
+                        }
+                        else
+                        {
+                            var c = await client.GetContainerAsync(job.Key, token);
+                            if (string.IsNullOrWhiteSpace(c.ContainerId)) c.ContainerId = job.Key;
+                            fetched.Add((new List<ContainerDto> { c }, null, null));
+                        }
+                    }
+                    catch (OpenTrackApiException ex) when (ex.StatusCode == 429)
+                    {
+                        Interlocked.Exchange(ref rateLimited, 1);
+                        log.LogWarning("Sync stopped early: OpenTrack rate limit reached");
+                    }
+                    catch (Exception ex) when ((ex is OpenTrackApiException or HttpRequestException or TaskCanceledException) && !ct.IsCancellationRequested)
+                    {
+                        Interlocked.Increment(ref failed);
+                        log.LogWarning(ex, "Sync failed for {Key}", job.Key);
+                    }
+                });
+
+            // DbContext isn't thread-safe: fetch in parallel above, write sequentially here.
+            var before = await db.TrackedContainers.CountAsync(ct);
+            var applied = 0;
+            foreach (var (items, mbl, scac) in fetched)
+                foreach (var c in await UpsertAsync(items, mbl, scac, ct)) { Cache(c); applied++; }
+            var added = Math.Max(0, await db.TrackedContainers.CountAsync(ct) - before);
+
+            log.LogInformation("Sync checked {Checked} upstream resources: {Added} added, {Updated} updated, {Failed} failed", jobs.Count, added, applied - added, failed);
+            return new(jobs.Count, failed, added, Math.Max(0, applied - added), false, rateLimited == 1, DateTimeOffset.UtcNow);
+        }
+        finally { SyncGate.Release(); }
     }
 
     public async Task ApplyWebhookAsync(string eventName, JsonElement data, CancellationToken ct)
@@ -125,29 +223,53 @@ public sealed class TrackingService(
     private async Task<List<ContainerDto>> UpsertAsync(IReadOnlyList<ContainerDto> containers, string? fallbackMbl,
         string? fallbackScac, CancellationToken ct)
     {
-        var ids = containers.Select(c => c.ContainerId.ToUpperInvariant()).ToList();
-        var existing = await db.TrackedContainers.Where(x => ids.Contains(x.ContainerId)).ToDictionaryAsync(x => x.ContainerId, ct);
-        var applied = new List<ContainerDto>();
+        // A blank id would collide on the unique index and, because everything is saved in ONE SaveChanges, take the
+        // whole batch down with it (silently - that is how "only some" containers of a master bill ended up indexed).
+        var batch = containers
+            .Where(c => !string.IsNullOrWhiteSpace(c.ContainerId))
+            .GroupBy(c => c.ContainerId.Trim().ToUpperInvariant())
+            .Select(g => (Id: g.Key, Dto: g.OrderByDescending(c => c.Timestamp ?? DateTimeOffset.MinValue).First()))
+            .ToList();
 
-        foreach (var c in containers)
+        if (batch.Count < containers.Count)
+            log.LogWarning("Upsert dropped {Count} container snapshot(s) with a blank or duplicate containerId", containers.Count - batch.Count);
+        if (batch.Count == 0) return [];
+
+        var ids = batch.Select(b => b.Id).ToList();
+
+        for (var attempt = 1; ; attempt++)
         {
-            var id = c.ContainerId.ToUpperInvariant();
-            if (!existing.TryGetValue(id, out var entity))
+            var existing = await db.TrackedContainers.Where(x => ids.Contains(x.ContainerId)).ToDictionaryAsync(x => x.ContainerId, ct);
+            var applied = new List<ContainerDto>();
+
+            foreach (var (id, c) in batch)
             {
-                entity = new TrackedContainer { ContainerId = id };
-                db.TrackedContainers.Add(entity);
-                existing[id] = entity;
+                if (!existing.TryGetValue(id, out var entity))
+                {
+                    entity = new TrackedContainer { ContainerId = id };
+                    db.TrackedContainers.Add(entity);
+                }
+                if (entity.Apply(c, fallbackMbl, fallbackScac)) applied.Add(c);
             }
-            if (entity.Apply(c, fallbackMbl, fallbackScac)) applied.Add(c);
-        }
 
-        try { await db.SaveChangesAsync(ct); }
-        catch (DbUpdateException ex)
-        {
-            // Two concurrent requests inserted the same container (unique index). The other write wins; ours is a no-op.
-            log.LogWarning(ex, "Concurrent upsert for {Ids}", string.Join(',', ids));
+            try
+            {
+                await db.SaveChangesAsync(ct);
+                return applied; // only what was actually persisted - callers cache this
+            }
+            catch (DbUpdateException ex)
+            {
+                // Typically a concurrent request inserted the same container (unique index). Drop our stale tracking state and
+                // retry once: the winner's row now exists, so this pass updates it instead of inserting.
+                db.ChangeTracker.Clear();
+                if (attempt >= 2)
+                {
+                    log.LogError(ex, "Upsert failed twice for {Ids}; rows were not indexed", string.Join(',', ids));
+                    return [];
+                }
+                log.LogWarning(ex, "Concurrent upsert for {Ids}; retrying", string.Join(',', ids));
+            }
         }
-        return applied;
     }
 
     private void Cache(ContainerDto dto)

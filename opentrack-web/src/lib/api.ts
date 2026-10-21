@@ -1,4 +1,4 @@
-import type { Container, ContainerSummary, MasterBill, Paged, RouteResponse } from '../types';
+import type { Container, ContainerSummary, MasterBill, Paged, RouteResponse, StatusCount, SyncResult } from '../types';
 
 const BASE = import.meta.env.VITE_API_BASE ?? '';
 
@@ -32,13 +32,20 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
 
 export interface TrackContainerBody { containerId: string; scacCode: string; masterBillNumber: string }
 export interface TrackMasterBillBody { number: string; scacCode?: string }
+export interface RegisterWebhookBody { url: string; name?: string; events?: string[] }
+export interface ReplayEventsParams { timestamp: number; containerId?: string; page?: number; perPage?: number }
+
+const toQuery = (p: object) => {
+  const qs = new URLSearchParams();
+  Object.entries(p).forEach(([k, v]) => v !== undefined && v !== '' && qs.set(k, String(v)));
+  return qs.toString();
+};
 
 export const api = {
-  listContainers: (p: { search?: string; status?: string; page?: number; pageSize?: number }) => {
-    const qs = new URLSearchParams();
-    Object.entries(p).forEach(([k, v]) => v !== undefined && v !== '' && qs.set(k, String(v)));
-    return request<Paged<ContainerSummary>>(`/api/containers?${qs}`);
-  },
+  listContainers: (p: { search?: string; status?: string; page?: number; pageSize?: number }) =>
+    request<Paged<ContainerSummary>>(`/api/containers?${toQuery(p)}`),
+  containerStatuses: () => request<StatusCount[]>('/api/containers/statuses'),
+  syncContainers: () => request<SyncResult>('/api/containers/sync', { method: 'POST' }),
   trackContainer: (body: TrackContainerBody) =>
     request<Container>('/api/containers', { method: 'POST', body: JSON.stringify(body) }),
   getContainer: (id: string, refresh = false) =>
@@ -49,4 +56,12 @@ export const api = {
   trackMasterBill: (body: TrackMasterBillBody) =>
     request<MasterBill>('/api/master-bills', { method: 'POST', body: JSON.stringify(body) }),
   getMasterBill: (number: string) => request<MasterBill>(`/api/master-bills/${encodeURIComponent(number)}`),
+
+  // Webhook management + event replay (Admin role when Auth:Enabled=true). Payload shapes are OpenTrack's, so they stay `unknown`
+  // here and are normalised in lib/normalize.ts.
+  listWebhooks: () => request<unknown>('/api/webhooks'),
+  registerWebhook: (body: RegisterWebhookBody) =>
+    request<unknown>('/api/webhooks', { method: 'POST', body: JSON.stringify(body) }),
+  deleteWebhook: (id: string) => request<void>(`/api/webhooks/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  replayEvents: (p: ReplayEventsParams) => request<unknown>(`/api/webhooks/events?${toQuery(p)}`),
 };
