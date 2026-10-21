@@ -1,4 +1,9 @@
-@import "tailwindcss";
+/* Explicit sources: auto-detection also scans generated output (the built bundle in OpenTrack.Api/wwwroot,
+   the published folders), which leaks third-party strings such as leaflet's "sticky"/"blur" into the CSS as
+   dead utilities. Pinning the source set keeps the published CSS identical on every machine. */
+@import "tailwindcss" source(none);
+@source "../src/**/*.{ts,tsx}";
+@source "../../index.html";
 
 @theme {
   --font-sans: "IBM Plex Sans", ui-sans-serif, system-ui, "Segoe UI", sans-serif;

@@ -49,8 +49,10 @@ caller's claims in `BookingsController` instead of trusting the query string.
 cd opentrack-web
 npm install
 npm run dev          # http://localhost:5173, /api proxied to :5080
-npm run build        # emits into ../OpenTrack.Api/wwwroot (served by the API)
+npm run build        # emits into ../../OpenTrack-Web (the IIS site folder)
 ```
+
+`npm run build -- --outDir ../OpenTrack.Api/wwwroot` emits into the API's `wwwroot` instead, for a single-host deployment.
 
 ## 3. Webhooks
 
@@ -63,4 +65,40 @@ npm run build        # emits into ../OpenTrack.Api/wwwroot (served by the API)
 
 - Replace `EnsureCreated()` + SQLite with EF migrations on SQL Server/Postgres (`dotnet ef migrations add Init`) and drop the `DateTimeOffsetToBinaryConverter` convention.
 - IIS: install the .NET 8 Hosting Bundle, publish with `dotnet publish -c Release`, set `OpenTrack__ApiKey` / `OpenTrack__WebhookSecret` as environment variables on the site/app pool, enable HTTPS.
+- Move the real `OpenTrack:ApiKey` / `OpenTrack:WebhookSecret` out of `appsettings.json` (that file is committed) and rotate the key that is in git history.
 - Set `Auth:Enabled=true` with your IdP, and send the access token from the SPA (`localStorage['access_token']` is read by `src/lib/api.ts`).
+
+### 4.1 Two hosts: web on `opentrack.vlogicx.com`, API on `ot-api.vlogicx.com`
+
+The SPA is a client-side router, so the two hosts must be configured as follows.
+
+**Web host (static files on IIS)**
+
+1. `npm ci && npm run build` inside `opentrack-web` - this writes `index.html` + `assets/` into `D:\OpenTrack-Application\OpenTrack-Web`.
+2. Copy the contents of that folder to the physical path of the `opentrack.vlogicx.com` IIS site.
+3. The build copies `opentrack-web/deploy/web.config` next to `index.html` automatically. It rewrites client-side routes
+   (`/bookings`, `/webhooks`, `/containers/{id}`) to `index.html`; without it those URLs return 404 on refresh.
+   Requires the IIS URL Rewrite module.
+
+**API host**
+
+4. `dotnet publish -c Release -o D:\OpenTrack-Application\OpenTrack-Api` and copy that folder to the site root.
+   The schema is created on startup, so the tracked-container table exists in Production.
+5. Point the database at a writable path and grant the app pool identity write access to it, e.g. environment variable
+   `ConnectionStrings__Default=Data Source=D:\OpenTrack\Data\opentrack.db`. The default `Data Source=opentrack.db` is relative
+   to the app folder and fails with `SQLite Error 14: 'unable to open database file'` when the folder is missing or not writable -
+   SQLite does not create the folder itself. The startup log states the resolved path and the exact error.
+6. `Cors:Origins` must contain the web origin (`https://opentrack.vlogicx.com` is already listed).
+
+**Build-time API origin**
+
+`opentrack-web/.env.production` sets `VITE_API_BASE=https://ot-api.vlogicx.com`, so the bundle calls the API cross-origin.
+Change that file when the API host changes. If you instead reverse-proxy the web host to the API host (IIS ARR), leave
+`VITE_API_BASE` empty so every call stays same-origin and CORS drops out of the picture.
+
+### 4.2 Single host
+
+`npm run build -- --outDir ../OpenTrack.Api/wwwroot` emits into the API's `wwwroot` and the API serves it
+(`UseStaticFiles` + `MapFallbackToFile`), so one site can host both. Publish the API *after* the web build - `wwwroot/` is
+git-ignored, so a publish from a clean clone ships no SPA.
+

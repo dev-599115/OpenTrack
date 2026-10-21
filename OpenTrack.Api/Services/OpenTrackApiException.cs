@@ -3,8 +3,9 @@ using System.Net.Http.Json;
 namespace OpenTrack.Api.Services;
 
 /// <summary>Raised when OpenTrack answers with a non-2xx status.</summary>
-public sealed class OpenTrackApiException(int statusCode, string message, string? code = null, int? retryAfterSeconds = null)
-    : Exception(message)
+public sealed class OpenTrackApiException(int statusCode, string message, string? code = null, int? retryAfterSeconds = null,
+    Exception? inner = null)
+    : Exception(message, inner)
 {
     public int StatusCode { get; } = statusCode;
     public string? Code { get; } = code;

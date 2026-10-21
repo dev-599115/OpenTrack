@@ -84,7 +84,15 @@ public sealed class OpenTrackClient(HttpClient http, IOptions<OpenTrackOptions> 
         using var res = await http.SendAsync(req, ct);
         if (!res.IsSuccessStatusCode) throw await OpenTrackApiException.FromResponseAsync(res, ct);
 
-        var result = await res.Content.ReadFromJsonAsync<T>(Json, ct);
-        return result ?? throw new OpenTrackApiException(502, "OpenTrack returned an empty response.");
+        try
+        {
+            var result = await res.Content.ReadFromJsonAsync<T>(Json, ct);
+            return result ?? throw new OpenTrackApiException(502, "OpenTrack returned an empty response.");
+        }
+        catch (JsonException ex)
+        {
+            // The payload did not match our model - that is an upstream problem, not a bad request from the caller.
+            throw new OpenTrackApiException(502, "OpenTrack returned a response we could not read.", inner: ex);
+        }
     }
 }

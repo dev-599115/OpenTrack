@@ -153,6 +153,9 @@ public sealed class MasterBillDto : ExtensibleDto
     public string Status { get; set; } = "LOCATING";
     public string Number { get; set; } = "";
     public string? ScacCode { get; set; }
-    public Dictionary<string, JsonElement>? ReferenceNumbers { get; set; }
+
+    /// <summary>OpenTrack sends an array here (e.g. []), sometimes an object - the raw value is kept as-is.</summary>
+    public JsonElement? ReferenceNumbers { get; set; }
+
     public List<ContainerDto>? Containers { get; set; }
 }

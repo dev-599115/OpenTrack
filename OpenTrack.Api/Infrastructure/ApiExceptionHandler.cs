@@ -24,6 +24,7 @@ public sealed class ApiExceptionHandler(ILogger<ApiExceptionHandler> log) : IExc
                     404 => (404, "Not found in OpenTrack", o.Message),
                     429 => (429, "OpenTrack rate limit reached", "Try again shortly."),
                     401 or 403 => (502, "OpenTrack authentication failed", "The server's OpenTrack API key was rejected."),
+                    502 => (502, "OpenTrack is unavailable", o.Message),
                     _ => (502, "OpenTrack is unavailable", "The tracking provider returned an error.")
                 };
                 if (o.StatusCode is 401 or 403 or >= 500) log.LogError(ex, "OpenTrack upstream error {Status}", o.StatusCode);

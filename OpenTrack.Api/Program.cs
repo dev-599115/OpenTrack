@@ -125,12 +125,31 @@ var app = builder.Build();
         string.IsNullOrWhiteSpace(bookingsUrl) ? "<empty - /api/bookings will return 503>" : bookingsUrl);
 }
 
+// Schema bootstrap: runs in every environment, not just Development. The tracked-container table is what every
+// dashboard endpoint reads, so a Production publish without it answers 500 ("no such table") instead of an empty list.
+// Migrate() once EF migrations exist; EnsureCreated() creates the schema until then. Both are idempotent.
+{
+    using var scope = app.Services.CreateScope();
+    var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+    var connection = db.Database.GetConnectionString();
+    try
+    {
+        if (db.Database.GetMigrations().Any()) db.Database.Migrate();
+        else db.Database.EnsureCreated();
+        app.Logger.LogInformation("Database schema ready ({Connection}).", connection);
+    }
+    catch (Exception ex)
+    {
+        app.Logger.LogError(ex,
+            "Database schema could not be initialised ({Connection}). The app pool identity needs write access to that folder, " +
+            "or the database is locked by another process.", connection);
+    }
+}
+
 app.UseExceptionHandler();
 
 if (app.Environment.IsDevelopment())
 {
-    using var scope = app.Services.CreateScope();
-    scope.ServiceProvider.GetRequiredService<AppDbContext>().Database.EnsureCreated(); // use EF migrations in production
     app.UseSwagger();
     app.UseSwaggerUI();
 }

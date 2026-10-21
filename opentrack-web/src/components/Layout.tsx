@@ -5,7 +5,7 @@ const navLink = ({ isActive }: { isActive: boolean }) =>
 
 export default function Layout() {
   return (
-    <div className="min-h-screen">
+    <div className="flex min-h-screen flex-col">
       <header className="bg-ink text-white">
         <div className="mx-auto flex max-w-7xl items-center justify-between px-4 py-3 sm:px-6">
           <Link to="/" className="flex items-center gap-2.5 text-lg font-semibold tracking-tight">
@@ -22,9 +22,14 @@ export default function Layout() {
           </nav>
         </div>
       </header>
-      <main className="mx-auto max-w-7xl px-4 py-6 sm:px-6">
+      <main className="mx-auto w-full max-w-7xl flex-1 px-4 py-6 sm:px-6">
         <Outlet />
       </main>
+      <footer className="bg-ink text-slate-300 text-center">
+        <div className="mx-auto max-w-7xl px-4 py-4 text-sm sm:px-6">
+          © {new Date().getFullYear()} Vision DataLabs LLP. · Powered by Vlogicx ERP
+        </div>
+      </footer>
     </div>
   );
 }
