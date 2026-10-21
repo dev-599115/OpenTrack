@@ -156,3 +156,24 @@ export interface WebhookEvent {
   timestamp?: string;
   raw: unknown;
 }
+
+
+/** One booking / container row from GET /api/bookings. A booking with no containerId has not been containerised yet. */
+export interface Booking {
+  partyName?: string;
+  masterBillNumber?: string;
+  containerId?: string;
+  carrierName?: string;
+  containerSize?: string;
+  consignee?: string;
+  jobNumber?: string;
+  supplier?: string;
+  poNumber?: string;
+  houseBillOfLadingNumber?: string;
+  program?: string;
+  distributionCenter?: string;
+  destinationAddress?: string;
+  destinationContainerFreightStation?: string;
+  originContainerFreightStation?: string;
+  customer?: string;
+}

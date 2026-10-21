@@ -17,6 +17,7 @@ export default function Layout() {
           </Link>
           <nav aria-label="Primary" className="flex items-center gap-1">
             <NavLink to="/" end className={navLink}>Containers</NavLink>
+            <NavLink to="/bookings" className={navLink}>Bookings</NavLink>
             <NavLink to="/webhooks" className={navLink}>Webhooks</NavLink>
           </nav>
         </div>

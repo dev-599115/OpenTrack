@@ -1,6 +1,6 @@
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useEffect, useState } from 'react';
-import { api } from './lib/api';
+import { api, type BookingFilters } from './lib/api';
 import { pickList, toEvent, toWebhook } from './lib/normalize';
 import type { Webhook } from './types';
 
@@ -91,3 +91,14 @@ export function useDeleteWebhook() {
 export const useReplayEvents = () => useMutation({ mutationFn: api.replayEvents });
 
 export const parseEvents = (raw: unknown) => pickList(raw).map(toEvent);
+
+// ---- Bookings --------------------------------------------------------------------------------------------------------
+
+/** Runs only once filters are submitted (userCountry is mandatory upstream). Results are cached for a minute. */
+export const useBookings = (filters: BookingFilters | null) =>
+  useQuery({
+    queryKey: ['bookings', filters],
+    queryFn: () => api.listBookings(filters as BookingFilters),
+    enabled: filters !== null,
+    staleTime: 60_000,
+  });

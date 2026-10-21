@@ -29,6 +29,20 @@ Config keys (`appsettings.json` / env vars, e.g. `OpenTrack__ApiKey`):
 | `Cors:Origins` | Allowed browser origins (only needed if the SPA is hosted separately). |
 | `Auth:Enabled/Authority/Audience` | Turns on JWT bearer for every endpoint except the webhook receiver and `/healthz`. `Admin` role guards webhook management. |
 
+### Bookings service (optional)
+
+The Bookings page reads `GET api/OpenTrack` on your internal bookings service through this API (`GET /api/bookings`).
+Without `Bookings:BaseUrl` the endpoint answers 503 and the rest of the app is unaffected.
+
+Set `Bookings:BaseUrl` in `appsettings.json` (or the `Bookings__BaseUrl` environment variable in production):
+
+```json
+"Bookings": { "BaseUrl": "https://<bookings-host>/" }
+```
+
+`UserCountry` is required by the service and is currently supplied by the browser. When `Auth:Enabled=true`, derive it from the
+caller's claims in `BookingsController` instead of trusting the query string.
+
 ## 2. Frontend
 
 ```bash

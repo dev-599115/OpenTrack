@@ -1,4 +1,4 @@
-import type { Container, ContainerSummary, MasterBill, Paged, RouteResponse, StatusCount, SyncResult } from '../types';
+import type { Booking, Container, ContainerSummary, MasterBill, Paged, RouteResponse, StatusCount, SyncResult } from '../types';
 
 const BASE = import.meta.env.VITE_API_BASE ?? '';
 
@@ -32,6 +32,14 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
 
 export interface TrackContainerBody { containerId: string; scacCode: string; masterBillNumber: string }
 export interface TrackMasterBillBody { number: string; scacCode?: string }
+export interface BookingFilters {
+  userCountry: string;
+  /** ISO 8601 */
+  cutoff?: string;
+  jobNo?: string;
+  containerNo?: string;
+  search?: string;
+}
 export interface RegisterWebhookBody { url: string; name?: string; events?: string[] }
 export interface ReplayEventsParams { timestamp: number; containerId?: string; page?: number; perPage?: number }
 
@@ -56,6 +64,8 @@ export const api = {
   trackMasterBill: (body: TrackMasterBillBody) =>
     request<MasterBill>('/api/master-bills', { method: 'POST', body: JSON.stringify(body) }),
   getMasterBill: (number: string) => request<MasterBill>(`/api/master-bills/${encodeURIComponent(number)}`),
+
+  listBookings: (p: BookingFilters) => request<Booking[]>(`/api/bookings?${toQuery(p)}`),
 
   // Webhook management + event replay (Admin role when Auth:Enabled=true). Payload shapes are OpenTrack's, so they stay `unknown`
   // here and are normalised in lib/normalize.ts.

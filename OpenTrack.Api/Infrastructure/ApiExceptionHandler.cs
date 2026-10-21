@@ -31,6 +31,18 @@ public sealed class ApiExceptionHandler(ILogger<ApiExceptionHandler> log) : IExc
                 if (o.RetryAfterSeconds is { } s) ctx.Response.Headers.RetryAfter = s.ToString();
                 break;
 
+            case BookingsApiException b:
+                (status, title, detail) = b.StatusCode switch
+                {
+                    400 => (400, "Bookings service rejected the request", b.Message),
+                    503 => (503, "Bookings service is not configured", b.Message),
+                    401 or 403 => (502, "Bookings service refused the request", "The bookings service answered 401/403. It may require authentication this API doesn't send yet."),
+                    _ => (502, "Bookings service is unavailable", "The bookings service returned an error.")
+                };
+                if (b.StatusCode is 401 or 403 or >= 500) log.LogError(ex, "Bookings upstream error {Status}", b.StatusCode);
+                else log.LogWarning("Bookings upstream {Status}: {Message}", b.StatusCode, b.Message);
+                break;
+
             case ArgumentException or JsonException or BadHttpRequestException:
                 (status, title, detail) = (400, "Invalid request", ex is ArgumentException ? ex.Message : "Malformed request body.");
                 break;

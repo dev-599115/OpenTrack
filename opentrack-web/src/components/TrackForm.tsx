@@ -1,13 +1,7 @@
 import { FormEvent, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useTrackContainer, useTrackMasterBill } from '../hooks';
-
-const CARRIERS: [string, string][] = [
-  ['APLU', 'American Presidents Line'], ['CMDU', 'CMA CGM'], ['COSU', 'COSCO'], ['EGLV', 'Evergreen'],
-  ['SUDU', 'Hamburg Süd'], ['HLCU', 'Hapag-Lloyd'], ['HDMU', 'HMM'], ['MAEU', 'Maersk'], ['MATU', 'Matson'],
-  ['MEDU', 'MSC'], ['ONEY', 'Ocean Network Express'], ['OOLU', 'OOCL'], ['SAFM', 'Safmarine'],
-  ['SMLM', 'SM Line'], ['MRSU', 'Sealand Maersk'], ['WHLC', 'Wan Hai'], ['YMLU', 'Yang Ming'], ['ZIMU', 'ZIM'],
-];
+import { CARRIERS } from '../lib/carriers';
 
 const input =
   'mt-1 block w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm shadow-sm focus:border-harbor';

@@ -20,6 +20,15 @@ builder.Services.AddOptions<OpenTrackOptions>()
     .ValidateDataAnnotations()
     .ValidateOnStart();
 
+// Bookings is optional (empty BaseUrl => 503 from the endpoint), but a non-empty value must be an absolute http(s) URL.
+builder.Services.AddOptions<BookingsOptions>()
+    .Bind(config.GetSection(BookingsOptions.Section))
+    .Validate(o => string.IsNullOrWhiteSpace(o.BaseUrl) ||
+                   (Uri.TryCreate(o.BaseUrl, UriKind.Absolute, out var u) &&
+                    (u.Scheme == Uri.UriSchemeHttp || u.Scheme == Uri.UriSchemeHttps)),
+              "Bookings:BaseUrl must be an absolute http(s) URL, e.g. https://localhost:7127")
+    .ValidateOnStart();
+
 // ---- Persistence + cache ------------------------------------------------------------------------------------------
 builder.Services.AddDbContext<AppDbContext>(o => o.UseSqlite(config.GetConnectionString("Default")));
 builder.Services.AddMemoryCache();
@@ -37,6 +46,32 @@ builder.Services.AddHttpClient<IOpenTrackClient, OpenTrackClient>((sp, http) =>
         // Retry transient failures, but never replay a non-GET response (429 is surfaced to the caller, not retried).
         o.Retry.ShouldHandle = args => ValueTask.FromResult(IsRetryable(args.Outcome));
     });
+
+// ---- Bookings service (optional; GET api/OpenTrack) -----------------------------------------------------------------
+var bookingsClientBuilder = builder.Services.AddHttpClient<IBookingsClient, BookingsClient>((sp, http) =>
+{
+    var o = sp.GetRequiredService<IOptions<BookingsOptions>>().Value;
+    if (!string.IsNullOrWhiteSpace(o.BaseUrl) &&
+        Uri.TryCreate(o.BaseUrl.Trim(), UriKind.Absolute, out var baseUri))
+    {
+        http.BaseAddress = new Uri(baseUri.ToString().TrimEnd('/') + "/");
+    }
+    http.DefaultRequestHeaders.Accept.ParseAdd("application/json, text/plain;q=0.9, */*;q=0.5");
+});
+
+// Local development only: accept the self-signed ASP.NET dev certificate of the bookings service (e.g. https://localhost:7127).
+// Must be configured on the IHttpClientBuilder, before AddStandardResilienceHandler (which returns a different builder type).
+if (builder.Environment.IsDevelopment())
+{
+    bookingsClientBuilder.ConfigurePrimaryHttpMessageHandler(() => new HttpClientHandler
+    {
+        ServerCertificateCustomValidationCallback = (_, cert, _, errors) =>
+            errors == System.Net.Security.SslPolicyErrors.None ||
+            (cert?.Subject.Contains("CN=localhost", StringComparison.OrdinalIgnoreCase) ?? false)
+    });
+}
+
+bookingsClientBuilder.AddStandardResilienceHandler(); // GET-only client, so the default retry policy is safe here
 
 builder.Services.AddScoped<ITrackingService, TrackingService>();
 
@@ -81,6 +116,14 @@ builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
 
 var app = builder.Build();
+
+// Startup diagnostics: shows exactly what the running process resolved (helps with env var / user-secrets overrides).
+{
+    var bookingsUrl = app.Services.GetRequiredService<IOptions<BookingsOptions>>().Value.BaseUrl;
+    app.Logger.LogInformation("Environment: {Env}. Bookings:BaseUrl resolved to '{Url}'",
+        app.Environment.EnvironmentName,
+        string.IsNullOrWhiteSpace(bookingsUrl) ? "<empty - /api/bookings will return 503>" : bookingsUrl);
+}
 
 app.UseExceptionHandler();
 

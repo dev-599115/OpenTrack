@@ -1,5 +1,6 @@
 import { Link, Route, Routes } from 'react-router-dom';
 import Layout from './components/Layout';
+import BookingsPage from './pages/BookingsPage';
 import ContainerPage from './pages/ContainerPage';
 import DashboardPage from './pages/DashboardPage';
 import MasterBillPage from './pages/MasterBillPage';
@@ -12,6 +13,7 @@ export default function App() {
         <Route index element={<DashboardPage />} />
         <Route path="containers/:id" element={<ContainerPage />} />
         <Route path="master-bills/:number" element={<MasterBillPage />} />
+        <Route path="bookings" element={<BookingsPage />} />
         <Route path="webhooks" element={<WebhooksPage />} />
         <Route path="*" element={<p>That page doesn’t exist. <Link className="text-harbor underline" to="/">Go to containers</Link></p>} />
       </Route>
